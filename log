@@ -1,0 +1,189 @@
+# Handle DEBUG
+if test -n "$DEBUG" -a "$DEBUG" != "false"; then
+    [[ $DEBUG =~ ^[[:digit:]]+ ]] &&
+        LL="${BASH_REMATCH[0]}"
+    [[ "$DEBUG" =~ NOP$ ]] &&
+        NOP=true
+        N="NOP"
+    DEBUG=true
+else
+    DEBUG=false
+fi
+if $DEBUG; then
+    test -z "$NOP" &&
+        NOP=false &&
+        unset N
+    D="DEBUG"
+else
+    NOP=false
+    unset N
+    unset D
+fi
+
+LL_ERR=0
+LL_WRN=1
+LL_VRB=2
+LL_INF=3
+LL_DBG=4
+LL_names=(
+    "ERR"
+    "WRN"
+    "VRB"
+    "INF"
+    "DBG"
+)
+LL_all=999
+test -z "$LL_default" &&
+    LL_default=$LL_WRN
+test -z "$LL_default_debug" &&
+    LL_default_debug=$LL_INF
+if test -z "$LL"; then
+    $DEBUG &&
+        LL=$LL_default_debug ||
+        LL=$LL_default
+fi
+
+# Export for subscripts.
+export DEBUG
+export NOP
+export LL
+
+# Return true if code shall be executed for this 'loglevel'.
+ll() {
+    local loglevel="$1"
+    test "$loglevel" -le "$LL"
+}
+
+
+# Set 'PREFIX' if you want to define the prefix used in echox() yourself.
+test -n "$PREFIX" ||
+    PREFIX="`basename "$0"`"
+
+echox() {
+    local -a opts
+    local -a args
+    local loglevel="$LL_default"
+    local framelevel="2"
+    local ll_type
+    local errcode=0
+    local err
+
+    # Support log levels and custom frame level.
+    while test -n "$1"; do
+        if [[ "$1" =~ ^-[[:digit:]]+$ ]]; then
+            loglevel="${1:1}"
+        elif [[ "$1" =~ ^\+[[:digit:]]+$ ]]; then
+            let framelevel+="${1:1}"
+        elif test "$1" = "--err"; then
+            errcode="$2"
+            err="($2)"
+            shift
+        else
+            break
+        fi
+        shift
+    done
+    ll "$loglevel" ||
+        return $errcode
+    ll_type="${LL_names[$loglevel]}"
+    test -n "$ll_type" ||
+        ll_type="$loglevel"
+
+
+    split_args opts args "$@"
+    echoxx "$loglevel" "$framelevel" "${opts[@]}" "$PREFIX[$ll_type]:" "${args[@]}" $err
+    return $errcode
+}
+
+echoxx() {
+    local loglevel="$1"
+    local framelevel=$((1 + $2))
+    shift 2
+    local trace
+
+    ll "$loglevel" ||
+        return
+
+    $DEBUG &&
+        trace="[${BASH_SOURCE[$framelevel]}@${FUNCNAME[$framelevel]}():${BASH_LINENO[$((framelevel - 1))]}]"
+
+    echo "$@${trace:+"	"}$trace" >&2
+}
+
+error() {
+    echox -$LL_ERR --err $? "$@"
+    exit $?
+}
+
+warn() {
+    echox -$LL_WRN "$@"
+}
+
+info() {
+    echox -$LL_INF "$@"
+}
+
+verb() {
+    echox -$LL_VRB "$@"
+}
+
+debug() {
+    echox -$LL_DBG "$@"
+}
+
+# Do not use this function directly, but use '$D'.
+DEBUG() {
+    if ! $NOP; then
+        echox -$LL_INF "LOG: `print_values_quoted "$@"`"
+        "$@"
+    else
+        echox -$LL_INF "NOP: `print_values_quoted "$@"`"
+    fi
+}
+
+# Do not use this function directly, but use '$N'.
+NOP() {
+    return $?
+}
+
+# Use this function to warn about deprecated functions.
+deprecated() {
+    warn +2 "usage of '${FUNCNAME[1]}()' is deprecated${1:+"; "}$@"
+}
+
+
+print_values_quoted() {
+    echo -n "["
+    for v in "$@"; do
+        echo -n "'$v', "
+    done
+    test "$#" -gt 0 &&
+        echo -ne "\b\b"
+    echo -ne "]"
+}
+
+
+# Split between options (consecutive arguments starting with '-' or '--') and "real" arguments. Everything after an argument of '--' is also considered to be a real argument.
+# Options are stored in array referenced by '$1', real arguments to array referenced by '$2'.
+split_args() {
+    test $# -ge 2 ||
+        error +1 "missing variable names"
+    local -n _opts="$1"
+    local -n _args="$2"
+    shift 2
+
+    _opts=()
+    while test "${1:0:1}" = "-"; do
+        # Use '--' to stop argument parsing.
+        if test "$1" = "--"; then
+            shift
+            break
+        fi
+        _opts+=("$1")
+        shift
+    done
+    _args=("$@")
+}
+
+
+# vim: set ft=sh:

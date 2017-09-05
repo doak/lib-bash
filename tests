@@ -1,0 +1,325 @@
+source "$LIB_BASH/log"
+source "$LIB_BASH/tools"
+source "$LIB_BASH/args"
+
+# Keep context if test framework is already running.
+if test -z "$WORKDIR"; then
+    WORKDIR="`mktemp --tmpdir --directory "${PREFIX}_$$_XXX"`"
+    BASEDIR="$(realpath "`dirname "${BASH_SOURCE[1]}"`")"
+    ENV="$WORKDIR/ENV"
+    push_cleanup rm -rf "$WORKDIR"
+    cd "$WORKDIR"
+else
+    source "$ENV"
+fi
+OLDPWD=$PWD
+cd "$BASEDIR"
+for f in "${SOURCE_FILES[@]}"; do
+    source "$f"
+done
+cd "$OLDPWD"
+
+
+run_tc() {
+    local tc="$1"
+    shift 1
+    local -a lhs
+    local -a rhs
+    split_at_seperator "--" "$@"
+    local tree_postfix="${lhs[0]}"
+    local tree="${tc//_/-}${tree_postfix:+"-"}${tree_postfix}"
+
+    counter=0
+    enter "$tree" &&
+        cat >"$ENV" <<EOF &&
+SOURCE_FILES=(${SOURCE_FILES[*]@Q})
+EOF
+        "$tc" "${rhs[@]}" &&
+        true ||
+            warn "'$tc' aborted because of an previous error."
+    leave "$tree"
+}
+
+enter() {
+    local tree="$1"
+    local archive="$BASEDIR/$tree.tar"
+
+    test -r "$archive"* ||
+        error "'$tree' is not a valid tree."
+
+    mkdir "$WORKDIR/$tree" &&
+        push_cleanup rm -rf "`realpath "$WORKDIR/$tree"`" &&
+        tar -xf "$archive"* --strip-components 1 -C "$WORKDIR/$tree" &&
+        pushd "$WORKDIR/$tree" >/dev/null &&
+        verb "Tree '$tree' prepared." &&
+        true ||
+        error "Failed to prepare tree."
+}
+
+leave() {
+    local errcode=$?
+
+    popd >/dev/null
+    pop_cleanup
+    return $errcode
+}
+
+
+counter=0
+create_logfile() {
+    local -n _log="$1"
+    local framelevel="$2"
+    local description="${3//[_, ]/-}"
+
+    ((counter++))
+    local tc="${FUNCNAME[$framelevel]//_/-}"
+    local count="`printf "%03d" "$counter"`"
+    local teststep="$tc-$count"
+    local testdesc="${description,,}"
+    local logfile="$WORKDIR/${teststep}_$testdesc.log"
+    local rerunfile="$WORKDIR/${teststep}_$testdesc.rerun"
+
+    _log=("$teststep" "$testdesc" "$logfile" "$rerunfile")
+}
+
+
+assert() {
+    local rerun_mode=false
+    if test "$1" = "RERUN"; then
+        rerun_mode=true
+        shift
+    fi
+    local framelevel=2
+    if [[ "$1" =~ ^\+[[:digit:]]+$ ]]; then
+        let framelevel+="${1:1}"
+        shift
+    fi
+    local description="$1"
+    shift
+    local errcode=0
+    local show_log=false
+
+    if ! $rerun_mode; then
+        local -a LOG
+        create_logfile LOG $framelevel "$description"
+    fi
+
+    cat >"${LOG[3]}" <<EOF
+LOG=(${LOG[@]@Q})
+assert RERUN ${description@Q} ${@@Q}
+EOF
+    verb +$framelevel -e "Running '${LOG[0]}' ..."
+    LL="${DUTLL:-$LL}" "$@" >"${STDOUT:-${LOG[2]}}" 2>&"${STDERR:-1}"
+    errcode=$?
+    if test $errcode -ne 0; then
+        echoxx $LL_WRN $framelevel -e "$PREFIX[DOC]: $description"
+        echoxx $LL_WRN $framelevel -e "$PREFIX[EXE]: `print_values_quoted "$@"`"
+        failed +$framelevel -e "FAIL($errcode) '${LOG[0]}'!"
+        ll $LL_VRB &&
+            show_log=true
+    elif ll $LL_INF; then
+        echoxx $LL_INF $framelevel -e "$PREFIX[DOC]: $description"
+        echoxx $LL_INF $framelevel -e "$PREFIX[EXE]: `print_values_quoted "$@"`"
+        success +$framelevel -e "SUCCESS '${LOG[0]}'."
+        show_log=true
+    fi
+    if $show_log; then
+        echo "------------"
+        if test "`stat -c %s "${LOG[2]}"`" -gt 0; then
+            cat "${LOG[2]}"
+        fi
+        echo "------------"
+    fi >&2
+
+    debug_shell $errcode "${LOG[0]}"
+    __="${LOG[2]}"
+    return $errcode
+}
+
+NOT() {
+    ! "$@"
+}
+
+PIPE() {
+    local lhs
+    local rhs
+
+    split_at_seperator "--" "$@"
+     "${lhs[@]}" | "${rhs[@]}"
+}
+
+SHELL() {
+    BASH_ENV="$LIB_BASH/tests" bash -c "$*"
+}
+
+count_lines() {
+    local expected="$1"
+    shift
+    local count
+
+    count="`"$@" | wc -l`"
+    if test -n "$count"; then
+        if test "$count" -eq "$expected"; then
+            info "Counted $count lines like expected."
+            return 0
+        else
+            failed "Counted $count lines, but expected $expected."
+        fi
+    else
+        error "Failed to run `print_values_quoted "$@"`."
+    fi
+    return 1
+}
+
+file_contains() {
+    local file="$1"
+    local pattern="$2"
+
+    $D grep -P "$pattern" "$file" || {
+        local errcode=$?
+        cat "$file"
+        return $errcode
+    }
+}
+
+
+success() {
+    echox -$LL_VRB "$@"
+}
+
+failed() {
+    echox -$LL_WRN "$@"
+}
+
+
+help() {
+    cat <<EOF
+Available commands:
+    rerun  [<teststep>]     Reexecute test step (defaults to current).
+    reshow [<teststep>]     Print log of test step (defaults to current).
+    setenv <var-assign>*    Set/list environment: <var-assign> = <var[=[<val>]]
+    help                    Shows this help.
+    exit                    Quits this debug session and continue test.
+
+Evironment variables:
+    DEBUG                   Start debug shell for failed test steps automatically.
+    TS                      Start debug shell for test steps matching content.
+                            If DEBUG is activated or test step failed, fuzzy
+                            matching is enabled (e.g. 'tc-whole' or 'tc-whole-002'
+                            for 'tc-whole-system-002'). In fact TS can be a regex.
+    DEBUG, LL               See also '\$LIB_BASH/log'.
+    DUTLL                   If defined it is used for DUT as '\$LL'.
+    STDOUT                  Overwrites default log file.
+    STDERR                  Overwrites stderr (defaults to STDOUT).
+
+<teststep>: E.g. '002' or 'tc-test-whole-system-002'.
+EOF
+}
+
+if [[ $TS =~ -[[:digit:]]+$ ]]; then
+    TN="${TS%-*}"
+    TC="${TS##*-}"
+else
+    TN="$TS"
+    unset TC
+fi
+export TN
+export TC
+
+debug_shell() {
+    local errcode=$?
+    local ts_errcode="$1"
+    local teststep="$2"
+    local strictness=strict
+
+    source "$ENV" ||
+        error "Failed to source environment '$ENV'."
+
+    if $DEBUG; then
+        if test "$ts_errcode" -ne 0; then
+            strictness=loosy
+        else
+            strictness=fuzzy
+        fi
+    else
+        if test "$ts_errcode" -ne 0; then
+            strictness=fuzzy
+        else
+            strictness=strict
+        fi
+    fi
+
+    case "$strictness" in
+        strict)
+            test -z "$TS" || ! [[ $teststep =~ ^$TS$ ]] &&
+                return $errcode
+            ;;
+        fuzzy)
+            test -z "$TS" || ! [[ $teststep =~ ^$TN.*${TC:+"-"}$TC$ ]] &&
+                return $errcode
+            ;;
+        loosy)
+            ! [[ $teststep =~ $TN.*${TC:+"-"}$TS$ ]] &&
+                return $errcode
+            ;;
+    esac
+
+    echo "Starting debug shell for '$teststep', quit to continue..." >&2
+    echo "Use 'rerun <teststep>' to run a step again, see 'help' for details." >&2
+    env -uDEBUG -uTS CURRENT_TESTSTEP="$teststep" BASEDIR="$BASEDIR" WORKDIR="$WORKDIR" ENV="$ENV" bash --rcfile "$LIB_BASH/tests"
+    return $errcode
+}
+
+list() {
+    local fileprefix="$WORKDIR/${CURRENT_TESTSTEP%-*}-$teststep"
+
+    ls "$fileprefix"*
+}
+
+rerun() {
+    local teststep="${1:-"$CURRENT_TESTSTEP"}"
+    local fileprefix="$WORKDIR/$teststep"
+    [[ $teststep =~ ^[[:digit:]]+$ ]] &&
+        local fileprefix="$WORKDIR/${CURRENT_TESTSTEP%-*}-$teststep"
+
+    for run in "$fileprefix"*".rerun"; do
+        verb "Rerun '$run':"
+        source "$run"
+    done
+}
+
+reshow() {
+    local teststep="${1:-"$CURRENT_TESTSTEP"}"
+    local fileprefix="$WORKDIR/$teststep"
+    [[ $teststep =~ ^[[:digit:]]+$ ]] &&
+        local fileprefix="$WORKDIR/${CURRENT_TESTSTEP%-*}-$teststep"
+
+    for log in "$fileprefix"*".log"; do
+        verb "Show log '$log':"
+        cat "$log"
+    done
+}
+
+setenv() {
+    local var
+    local value
+
+    if test $# -eq 0; then
+        cat "$ENV"
+        return
+    fi
+
+    for env in "$@"; do
+        if [[ $env =~ = ]]; then
+            var="${env%%=*}"
+            value="${env#*=}"
+        else
+            var="$env"
+            value="${!env}"
+        fi >> "$ENV"
+        sed -i "/^$var=/d" "$ENV"
+        echo "$var='$value'" >>"$ENV"
+    done
+}
+
+# vim: set ft=sh:

@@ -1,0 +1,13 @@
+# DEPRECATED: Functionality is split up in distinct files. Please include these.
+
+basedir="`dirname "${BASH_SOURCE[0]}"`"
+export LIB_BASH="$basedir"
+
+source "$LIB_BASH/log" &&
+source "$LIB_BASH/tools" &&
+source "$LIB_BASH/args" &&
+true
+
+warn "usage of '${BASH_SOURCE[0]}' is deprecated"
+
+# vim: set ft=sh:

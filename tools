@@ -1,0 +1,58 @@
+# Search for first existing binary of given list in PATH.
+lookup_binary() {
+    for binary in "$@"; do
+        if which "$binary" >/dev/null 2>&1; then
+            echo "$binary"
+            return
+        fi
+    done
+    warn "Unable to find binary of '$*'."
+    return 1
+}
+
+
+# Ignore empty lines and comments started with '$1' (defaults to '#').
+skip_comments() {
+    sed "s/\\s*${1:-#}.*\$//;/^\\s*\$/d"
+}
+
+# Only source that if not already enabled.
+test -n "$skip_cleanup" ||
+    skip_cleanup=false
+if ! $skip_cleanup; then
+    skip_cleanup=true
+    cleanup_actions=()
+    push_cleanup() {
+        local a=("$@")
+        debug +1 "push cleanup: `print_values_quoted "${a[@]}"`"
+        cleanup_actions=("(${a[*]@Q})" "${cleanup_actions[@]}")
+    }
+    pop_cleanup() {
+        test $# -eq 0 ||
+        deprecated "Argument is not supported anymore. Use 'rewind_cleanup()' instead."
+        local a
+
+        eval a="${cleanup_actions[0]}"
+        debug +2 "pop cleanup: `print_values_quoted "${a[@]}"`"
+        "${a[@]}"
+        cleanup_actions=("${cleanup_actions[@]:1}")
+    }
+    mark_cleanup() {
+        local mark=${#cleanup_actions[@]}
+        debug "Mark clean-up: $mark"
+        echo $mark
+    }
+    rewind_cleanup() {
+        local mark="$1"
+        debug +1 "Rewind clean-up: $mark"
+        while test ${#cleanup_actions[@]} -gt "$mark"; do
+            pop_cleanup
+        done
+    }
+    run_cleanup() {
+        rewind_cleanup 0
+    }
+    trap "run_cleanup" EXIT
+fi
+
+# vim: set ft=sh:

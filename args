@@ -1,0 +1,340 @@
+# Split arguments at seperator '$1'. First part, if seperator exists, is appended to variable 'lhs', remaining arguments are appended to variable 'rhs'.
+split_at_seperator() {
+    local sep="$1"
+    shift
+    local -a tmp
+
+    while test $# -ne 0; do
+        if test "$1" == "$sep"; then
+            lhs+=("${tmp[@]}")
+            shift
+            rhs+=("$@")
+            return
+        fi
+        tmp+=("$1")
+        shift
+    done
+    rhs+=("${tmp[@]}")
+}
+
+# Take name in $1, strip leading and replace characters (with '_') which are not valid as identifier: e.g. string '--option-cool' gets 'option_cool'.
+normalise_arg() {
+    local arg="$1"
+
+    echo "$arg" |
+    sed "s/^-*[[:digit:]]*//;s/[]<>()[]\+//g;s/[^[:alnum:]_]\+/_/g"
+}
+
+# Save next values, i.e. stores following values in variable derived by argument name. Arguments are detected using pattern in '$1'. Values are stored in variable named '$arg_<agument-name>'.
+# Please refer to 'get_args()' for flags, error codes and return value.
+get_arg() {
+    push_flags "$1" "1" &&
+        shift
+    get_args "$__" "$@"
+}
+
+# Save next values, i.e. stores following values in variable derived by argument name. Arguments are detected using pattern in '$1'. Values are stored in arrays named '$arg_<argument-name>'.
+# The following flags are supported for the very first argument (enclosed in '$' characters):
+#   0: No value is allowed (see flag 'f').
+#   1: Exactly on value is allowed.
+#   *: Any number of values are allowed.
+#   ?: Zero or one value is allowed.
+#   +: One or more values are allowed (default behaviour).
+#   f: Only true/false values are allowed. If no value is given, it is set automatically.
+#   b: Break after one value has been saved.
+#   A: Do not expect an argument at start.
+#   s: Skip (shift) detected stop argument.
+# Return number of consumed arguments in '$__' or 0 in case of failure.
+# Return true on success or the following error codes:
+ARGS_ERR_INVALID_VALUE=1
+ARGS_ERR_MISSING_VALUE=2
+ARGS_ERR_UNEXPECTED_VALUE=3
+ARGS_ERR_MISSING_ARG=4
+ARGS_WRN_first=20
+ARGS_WRN_STOP_PARSED=20
+ARGS_WRN_NO_ARG=21
+get_args() {
+    pop_flags "$1" "0" "zero" "1" "one" "*" "opt" "?" "at_most_one" "+" "at_least_one" "f" "flag_value" "b" "break" "A" "no_argument_at_start" "s" "skip_stop" &&
+        shift &&
+        ensure_empty_flags "$__"
+
+    local arg_pattern="$1"
+    local argument="$2"
+    local normalised="`normalise_arg "$argument"`"
+    local tmpvar
+    local varname="arg_${normalised#no_}"
+    local -n var="$varname"
+    shift 1
+    local value
+
+    debug "Used argument pattern: '$arg_pattern'"
+
+    __=0
+    # There are no (remaining) arguments.
+    if test $# -eq 0; then
+        debug "There are no arguments."
+        return $ARGS_ERR_MISSING_ARG
+    elif [[ $argument =~ $arg_pattern ]]; then
+        # Stop argument parsed (e.g. '--').
+        if test -z "$normalised"; then
+            debug "Stop argument ('$argument') parsed."
+            $skip_stop &&
+                let __++
+            return $ARGS_WRN_STOP_PARSED
+        fi
+    else
+        # Does not start with an argument.
+        if ! $no_argument_at_start; then
+            debug "No argument ('$argument') parsed at start."
+            return $ARGS_WRN_NO_ARG
+        fi
+    fi
+    __=1
+    shift 1
+
+    while test $# -ne 0 && ! [[ $1 =~ $arg_pattern ]] ; do
+        value="$1"
+        let __++
+        shift
+        debug "Store value '$value' in variable '$varname'."
+        tmpvar+=("$value")
+        $break &&
+            break
+    done
+    $skip_stop &&
+        [[ $1 =~ $arg_pattern ]] &&
+        let __++ &&
+        debug "Argument '$1' skipped."
+
+    local n="${#tmpvar[@]}"
+    if test "$n" -eq 0; then
+        debug "No value parsed."
+        if ! ( $zero || $opt || $at_most_one ); then
+            # Missing value.
+            __=0
+            warn +1 "Missing value for '$argument'."
+            return $ARGS_ERR_MISSING_VALUE
+        elif $flag_value; then
+            [[ $normalised =~ ^no_ ]] &&
+                tmpvar=false ||
+                tmpvar=true
+        fi
+    else
+        if $zero || (( $one || $at_most_one ) && test "$n" -ne 1); then
+            __=0
+            warn +1 "unexpected value(s) `print_values_quoted "${var[@]}"` for '$argument'."
+            return $ARGS_ERR_UNEXPECTED_VALUE
+        fi
+        if $flag_value; then
+            for v in "${value[@]}"; do
+                case $v in
+                    "0"|"1"|"false"|"true")
+                        ;;
+                    *)
+                        __=0
+                        warn +1 "invalid value '$v' for '$argument'."
+                        return $ARGS_ERR_INVALID_VALUE
+                        ;;
+                esac
+            done
+        fi
+    fi
+    var=("${tmpvar[@]}")
+}
+
+# Save /all/ next values in corresponding arrays. See 'get_args()' for details.
+get_all_args() {
+    local flags
+    detect_flags "$1" &&
+        flags="$__" &&
+        shift
+
+    local shifted=0
+    local arg_pattern="$1"
+    shift
+
+    while test $# -ne 0; do
+        get_args $flags "$arg_pattern" "$@"
+        case $? in
+            0)
+                shift $__
+                let shifted+=__
+                ;;
+            $ARGS_WRN_STOP_PARSED)
+                shift
+                let shifted++
+                break
+                ;;
+            *)
+                error "Argument parsing failed for '$1'."
+                ;;
+        esac
+    done
+    __=$shifted
+}
+
+# Parse argument list and call the corresponding function for each single argument using the arguments till the next argument. Arguments are detected using pattern "$1".
+# The following flags are supported for the very first argument (enclosed in '$' characters) directly for this function. Further flags are passed to 'get_args()' if enabled:
+#   S: Do not process arguments by 'get_args()', pass all to callback directly.
+# Return number of consumed arguments in '$__'.
+call_args() {
+    pop_flags "$1" "S" "skip_arg_handling" &&
+        shift &&
+        opt_flags="$__" ||
+        opt_flags='$*$'
+
+    local arg_pattern="$1"
+    local callback="$2"
+    shift 2
+
+    local function
+    local -a func_args
+    local shifted=0
+
+    while [[ $1 =~ $arg_pattern ]]; do
+        arg_func=()
+        function="`normalise_arg "$1"`"
+        shift
+        let shifted++
+
+        # Stop argument parsed (e.g. '--').
+        test -z "$function" &&
+            break
+
+        if ! $skip_arg_handling; then
+            get_args "$opt_flags" "$arg_pattern" "--func" "$@" ||
+                error "Argument parsing failed for '$1'."
+            let __--
+            shift "$__"
+            let shifted+=__
+            debug "Call callback: '$callback' '$function' `print_values_quoted "${arg_func[@]}"`"
+            "$callback" "$function" "${arg_func[@]}"
+        else
+            # Callback has to handle '$__' to shift arguments.
+            __=1
+            "$callback" "$function" "$@"
+            let __--
+            shift "$__"
+            let shifted+=__
+        fi
+    done
+    __=$shifted
+}
+
+func_prefix="func_"
+func_def_multiplexer() {
+    local function="$1"
+    shift
+
+    "$func_prefix$function" "$@"
+    case "$?" in
+        0)
+            ;;
+        127)
+            error "Function '$func_prefix$function' is unknown."
+            ;;
+        *)
+            error "Function '$func_prefix$function' returned failure ($?)."
+            ;;
+    esac
+}
+
+print_functions() {
+    local func_prefix="$1"
+    local indent="${2:-"    "}"
+
+    compgen -A function "$func_prefix" | sed "s/^$func_prefix/$indent/"
+}
+
+
+# Detect if '$1' are flags.
+detect_flags() {
+    local flags="$1"
+
+    if [[ $flags =~ ^\$[^\$]*\$$ ]]; then
+        debug +1 "flags detected: '$flags'"
+        return 0
+    else
+        debug +1 "no flags present ('$flags')"
+        return 1
+    fi
+}
+
+ensure_empty_flags() {
+    local flags="$1"
+
+    if test "$flags" = '$$'; then
+        return 0
+    elif detect_flags "$flags"; then
+        warn +1 "Unexpected flags: '$flags'"
+        return 1
+    else
+        error +1 "Invalid flags: '$flags'"
+    fi
+}
+
+# Set variables based on flags ('$<flag>...$') passed in '$1'. Remaing args are '<flag> <variabe-name>'-pairs which should be tested/set.
+# Set variable to true if flags is set, false otherwise. Flag is removed and remaining flags are returned in '$__'.
+pop_flags() {
+    local flags="$1"
+    shift
+    local detected=false
+
+    detect_flags "$flags" &&
+        detected=true
+
+    while test $# -ge 2; do
+        local flag="$1"
+        local name="$2"
+        shift 2
+        local -n _opt="$name"
+        local flag_q="\\$flag"
+
+        test ${#flag} -eq 1 ||
+            error +1 "invalid option flag '$flag'"
+        _opt=false
+        if $detected && [[ $flags =~ "$flag" ]]; then
+            _opt=true
+            flags="${flags/$flag_q/}"
+        fi
+        $_opt &&
+            info +1 "true  '$flag' ($name)" ||
+            debug +1 "false '$flag' ($name)"
+    done
+    debug "remaining flags: '$flags'"
+    test $# -ne 1 ||
+        error +1 "missing variable name (invalid number of arguments)"
+
+    __="$flags"
+    $detected
+}
+
+# Append flags (passed as single characters) to (optional) flags '$1'
+# Returns resulting flags in '$__'.
+# Returns true if '$1' has been valid flags ('$<flag>...$').
+push_flags() {
+    local flags="$1"
+    shift
+
+    local detected=false
+    local raw
+
+    detect_flags "$flags" &&
+        detected=true
+    if $detected; then
+        raw="${flags:1:-1}"
+    fi
+    while test $# -ge 1; do
+        local flag="$1"
+        shift
+        test ${#flag} -eq 1 ||
+            error +1 "invalid option flag '$flag'"
+        raw+="$flag"
+    done
+
+    __="\$$raw\$"
+    $detected
+}
+
+
+# vim: set ft=sh:
